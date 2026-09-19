@@ -1,0 +1,10 @@
+Package: com.mikiyan1978.switchergrid
+Name: SwitcherGrid
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Displays the App Switcher (multitasking) screen as Apple's built-in iPad-style grid instead of the default horizontal carousel. Swipe down on any card to kill all open apps at once.
+Maintainer: mikiyan1978
+Author: mikiyan1978
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), preferenceloader
+Icon: /Library/PreferenceBundles/SwitcherGridPrefs.bundle/icon@3x.png
