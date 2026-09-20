@@ -13,11 +13,15 @@
 //   使われる値2 = グリッド)、これを強制するだけで安全にグリッド化できる。
 //   これはOSS版NewGridSwitcher(iOS11-14向け)が使っていたのと同じ仕組みで、
 //   iOS16.7.16でも生きていることを実機で確認済み。
+// - SBFluidSwitcherViewControllerは生成時点のswitcherStyleを前提にレイアウトを
+//   組むため、設定変更は既存インスタンスには反映されない(実機で確認済み)。
+//   Eneko/StatusChameleonと同じ実績のある方式にならい、自動検知はせず、
+//   設定画面の手動Respringボタンで反映させる。
 // - 全kill機能は、Apple純正の単体kill(-[SBFluidSwitcherViewController
 //   killContainer:forReason:]、reason=1)を、現在表示中の全カード
-//   (-visibleItemContainers、NSDictionary)に対して少しずつ時間差(0.06秒刻み)で
+//   (-visibleItemContainers、NSDictionary)に対して少しずつ時間差で
 //   呼び出すことで実現。個別killは常にApple純正のアニメーションを使うため、
-//   自作の描画コードなしに「波状に崩れて消える」滑らかな見た目になる。
+//   自作の描画コードなしに「波状に崩れて消える」見た目になる。
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -70,6 +74,18 @@ static void SGReloadPrefs(void) {
     [((UIViewController *)self).view addGestureRecognizer:killAllSwipe];
 }
 
+// 開いた瞬間が「一瞬で切り替わる」ように見える問題への対応。view自体のalphaは
+// switcher内部の連続再レイアウトの対象外(transformとは違って上書きされない、
+// killアニメーションの検証時に確認済み)なので、フェードインを安全に足せる。
+- (void)viewWillAppear:(BOOL)animated {
+    UIView *view = ((UIViewController *)self).view;
+    view.alpha = 0.0;
+    %orig;
+    [UIView animateWithDuration:0.28 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        view.alpha = 1.0;
+    } completion:nil];
+}
+
 // 既存のswitcher自身のドラッグ/パン系ジェスチャーと同時発火を許可しないと、
 // UIKit標準の排他制御によりこちらが一切発火しない(実機で確認済み)。
 %new
@@ -77,10 +93,27 @@ static void SGReloadPrefs(void) {
     return YES;
 }
 
-// 下スワイプで、現在表示中の全カードを0.06秒刻みで順にkillしていく。
+// アプリが1つも無い状態でスイッチャーを開いた場合、瞬時にホーム画面へ戻す。
+// handleHomeButtonPressはこのクラス自身が持つ、物理ホームボタン/ジェスチャーで
+// 呼ばれるのと全く同じ「ホームに戻る」処理(実機のメソッド一覧で確認済み)。
+// dispatch_afterで遅延させると効かず、%orig直後に同期的に呼ぶ必要があった
+// (実機検証で確認済み)。
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    NSDictionary *containers = ((NSDictionary * (*)(id, SEL))objc_msgSend)(self, @selector(visibleItemContainers));
+    if (containers.count > 0) return;
+    SEL homeSel = @selector(handleHomeButtonPress);
+    if ([(id)self respondsToSelector:homeSel]) {
+        ((void (*)(id, SEL))objc_msgSend)(self, homeSel);
+    }
+}
+
+// 下スワイプで、現在表示中の全カードを時間差で順にkillしていく。
 // 個別killはApple純正のアニメーション付き処理(reason=1、通常の上スワイプkillと同じ)を
-// そのまま呼び出すため、自前で描画を書かなくても「波状に崩れて消える」滑らかな
-// 見た目になる。
+// そのまま呼び出すため、自前で描画を書かなくても「波状に崩れて消える」見た目になる。
+// カード自体のframe/transformはswitcher内部の連続再レイアウトが常時上書きするため、
+// 独自のUIViewアニメーションは効かない(実機で確認済み)。代わりに各killのタイミングに
+// 合わせてハプティックを刻み、体感的な波を作る。
 %new
 - (void)sg_handleKillAllSwipe:(UISwipeGestureRecognizer *)gr {
     if (!gKillAllSwipeEnabled) return;
@@ -90,12 +123,17 @@ static void SGReloadPrefs(void) {
     NSArray *snapshot = [containers.allValues copy];
     if (snapshot.count == 0) return;
 
-    NSTimeInterval stagger = 0.06;
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [haptic prepare];
+    [haptic impactOccurred];
+
+    NSTimeInterval stagger = 0.15;
     void (*killIMP)(id, SEL, id, NSInteger) = (void (*)(id, SEL, id, NSInteger))objc_msgSend;
     SEL killSel = @selector(killContainer:forReason:);
     [snapshot enumerateObjectsUsingBlock:^(id container, NSUInteger idx, BOOL *stop) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((double)idx * stagger * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             killIMP(self, killSel, container, 1);
+            if (idx > 0) [haptic impactOccurred];
         });
     }];
 }

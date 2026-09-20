@@ -19,6 +19,8 @@
 			<string>グリッド表示を有効化</string>
 			<key>key</key>
 			<string>GridEnabled</string>
+			<key>defaults</key>
+			<string>com.mikiyan1978.switchergrid</string>
 			<key>default</key>
 			<true/>
 			<key>PostNotification</key>
@@ -37,6 +39,8 @@
 			<string>下スワイプで全kill</string>
 			<key>key</key>
 			<string>KillAllSwipeEnabled</string>
+			<key>defaults</key>
+			<string>com.mikiyan1978.switchergrid</string>
 			<key>default</key>
 			<true/>
 			<key>PostNotification</key>
@@ -47,6 +51,20 @@
 			<string>PSGroupCell</string>
 			<key>footerText</key>
 			<string>アプリスイッチャーでカードを下にスワイプすると、表示中の全アプリを波状のアニメーションでkillします。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>グリッド表示の切り替えはリスプリングしないと反映されません。設定変更後は下のRespringボタンを押してください。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSButtonCell</string>
+			<key>label</key>
+			<string>Respring</string>
+			<key>action</key>
+			<string>sg_respringTapped</string>
 		</dict>
 	</array>
 </dict>
