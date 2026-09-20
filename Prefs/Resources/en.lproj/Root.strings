@@ -1,0 +1,8 @@
+"GridFooter" = "Shows the App Switcher as an iPad-style grid instead of the default carousel. Toggling this requires a Respring to take effect — tap Respring below after changing it.";
+"GridEnabledLabel" = "Enable Grid View";
+
+"KillAllFooter" = "Swipe down on any card in the App Switcher, or tap the \"Close All\" button in the top right, to kill every open app with a cascading animation. Opening the App Switcher with nothing running returns to the Home Screen automatically.";
+"KillAllEnabledLabel" = "Enable Kill All";
+
+"RespringFooter" = "Respring to make sure SwitcherGrid's settings changes take effect.";
+"RespringLabel" = "Respring";

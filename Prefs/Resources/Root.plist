@@ -9,14 +9,16 @@
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
-			<key>footerText</key>
+			<key>headerText</key>
 			<string>SwitcherGrid v1.0 by mikiyan1978</string>
+			<key>footerText</key>
+			<string>GridFooter</string>
 		</dict>
 		<dict>
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
-			<string>グリッド表示を有効化</string>
+			<string>GridEnabledLabel</string>
 			<key>key</key>
 			<string>GridEnabled</string>
 			<key>defaults</key>
@@ -26,17 +28,18 @@
 			<key>PostNotification</key>
 			<string>com.mikiyan1978.switchergrid/reload</string>
 		</dict>
+
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>footerText</key>
-			<string>アプリスイッチャーをカルーセル(Appleデフォルト)ではなく、iPad風のグリッドで表示します。</string>
+			<string>KillAllFooter</string>
 		</dict>
 		<dict>
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>label</key>
-			<string>全killを有効化</string>
+			<string>KillAllEnabledLabel</string>
 			<key>key</key>
 			<string>KillAllSwipeEnabled</string>
 			<key>defaults</key>
@@ -46,43 +49,18 @@
 			<key>PostNotification</key>
 			<string>com.mikiyan1978.switchergrid/reload</string>
 		</dict>
+
 		<dict>
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>footerText</key>
-			<string>アプリスイッチャーでカードを下にスワイプするか、右上の「すべて閉じる」ボタンをタップすると、表示中の全アプリを波状のアニメーションでkillします。</string>
-		</dict>
-		<dict>
-			<key>cell</key>
-			<string>PSTableCell</string>
-			<key>cellClass</key>
-			<string>SGAnimationCell</string>
-			<key>key</key>
-			<string>TransitionStyle</string>
-			<key>defaults</key>
-			<string>com.mikiyan1978.switchergrid</string>
-			<key>default</key>
-			<integer>0</integer>
-			<key>label</key>
-			<string>開くときのアニメーション</string>
-		</dict>
-		<dict>
-			<key>cell</key>
-			<string>PSGroupCell</string>
-			<key>footerText</key>
-			<string>アプリスイッチャーを開いたときの見せ方のアニメーションを選べます。</string>
-		</dict>
-		<dict>
-			<key>cell</key>
-			<string>PSGroupCell</string>
-			<key>footerText</key>
-			<string>グリッド表示の切り替えはリスプリングしないと反映されません。設定変更後は下のRespringボタンを押してください。</string>
+			<string>RespringFooter</string>
 		</dict>
 		<dict>
 			<key>cell</key>
 			<string>PSButtonCell</string>
 			<key>label</key>
-			<string>Respring</string>
+			<string>RespringLabel</string>
 			<key>action</key>
 			<string>sg_respringTapped</string>
 		</dict>

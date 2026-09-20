@@ -1,0 +1,8 @@
+"GridFooter" = "アプリスイッチャーをカルーセル(Appleデフォルト)ではなく、iPad風のグリッドで表示します。グリッド表示の切り替えはリスプリングしないと反映されません。設定変更後は下のRespringボタンを押してください。";
+"GridEnabledLabel" = "グリッド表示を有効化";
+
+"KillAllFooter" = "アプリスイッチャーでカードを下にスワイプするか、右上の「すべて閉じる」ボタンをタップすると、表示中の全アプリを波状のアニメーションでkillします。何もない状態でアプリスイッチャーを開くと、自動でホーム画面に戻ります。";
+"KillAllEnabledLabel" = "全killを有効化";
+
+"RespringFooter" = "SwitcherGridの設定変更を確実に反映するには、リスプリングしてください。";
+"RespringLabel" = "Respring";

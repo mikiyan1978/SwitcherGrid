@@ -30,23 +30,13 @@
 static NSString *const kPrefsPath = @"/var/mobile/Library/Preferences/com.mikiyan1978.switchergrid.plist";
 static const NSInteger kGridStyleValue = 2; // Apple純正の「グリッドスタイル」に対応する値(実機調査で確認済み)
 
-typedef NS_ENUM(NSInteger, SGTransitionStyle) {
-    SGTransitionFade = 0,
-    SGTransitionZoom,
-    SGTransitionSlideUp,
-    SGTransitionSlideDown,
-    SGTransitionRotateFade,
-};
-
 static BOOL gGridEnabled = YES;
 static BOOL gKillAllSwipeEnabled = YES;
-static SGTransitionStyle gTransitionStyle = SGTransitionFade;
 
 static void SGReloadPrefs(void) {
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:kPrefsPath];
     gGridEnabled = prefs[@"GridEnabled"] ? [prefs[@"GridEnabled"] boolValue] : YES;
     gKillAllSwipeEnabled = prefs[@"KillAllSwipeEnabled"] ? [prefs[@"KillAllSwipeEnabled"] boolValue] : YES;
-    gTransitionStyle = prefs[@"TransitionStyle"] ? [prefs[@"TransitionStyle"] integerValue] : SGTransitionFade;
 }
 
 %group SwitcherGridHooks
@@ -84,47 +74,6 @@ static void SGReloadPrefs(void) {
     [((UIViewController *)self).view addGestureRecognizer:killAllSwipe];
 }
 
-// 開いた瞬間が「一瞬で切り替わる」ように見える問題への対応。view自体のalpha/
-// transformはswitcher内部の連続再レイアウトの対象外(カード自体のtransformとは
-// 違って上書きされない、killアニメーションの検証時に確認済み)なので、
-// 独自の入場アニメーションを安全に足せる。設定で複数のスタイルから選べる。
-- (void)viewWillAppear:(BOOL)animated {
-    // transformをここで先に触ると、%orig内部の「今どのカードが見えているか」の
-    // 座標計算に影響し、後段のviewDidAppearでの空判定(visibleItemContainers)が
-    // 乱れることが実機で確認できた。そのため%origは必ず未加工のviewに対して
-    // 先に走らせ、入場アニメーション用の初期状態は%origの後にだけ設定する。
-    %orig;
-
-    UIView *view = ((UIViewController *)self).view;
-    CGFloat h = view.bounds.size.height;
-    CGAffineTransform fromTransform = CGAffineTransformIdentity;
-
-    switch (gTransitionStyle) {
-        case SGTransitionZoom:
-            fromTransform = CGAffineTransformMakeScale(0.85, 0.85);
-            break;
-        case SGTransitionSlideUp:
-            fromTransform = CGAffineTransformMakeTranslation(0, h * 0.12);
-            break;
-        case SGTransitionSlideDown:
-            fromTransform = CGAffineTransformMakeTranslation(0, -h * 0.12);
-            break;
-        case SGTransitionRotateFade:
-            fromTransform = CGAffineTransformRotate(CGAffineTransformMakeScale(0.9, 0.9), M_PI * 0.03);
-            break;
-        case SGTransitionFade:
-        default:
-            break;
-    }
-
-    view.alpha = 0.0;
-    view.transform = fromTransform;
-    [UIView animateWithDuration:0.32 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
-        view.alpha = 1.0;
-        view.transform = CGAffineTransformIdentity;
-    } completion:nil];
-}
-
 // 既存のswitcher自身のドラッグ/パン系ジェスチャーと同時発火を許可しないと、
 // UIKit標準の排他制御によりこちらが一切発火しない(実機で確認済み)。
 %new
@@ -137,6 +86,14 @@ static void SGReloadPrefs(void) {
 // 呼ばれるのと全く同じ「ホームに戻る」処理(実機のメソッド一覧で確認済み)。
 // dispatch_afterで遅延させると効かず、%orig直後に同期的に呼ぶ必要があった
 // (実機検証で確認済み)。
+//
+// 注記: 「開くときのアニメーション」機能はここに実装を試みたが、実機検証の
+// 結果、通常のアプリ起動時にも同じviewDidAppearが(バックグラウンドで保持
+// されている同一インスタンスの)裏方セッションとして発火することが判明し、
+// アプリ起動時にアニメーションが誤発火する副作用が生じた。isKeyWindow等の
+// 判定条件でも安全に区別できず、アプリ起動とswitcher表示が同一の
+// viewDidAppearイベントを共有しているため、安全な実装方法が見つからな
+// かった。そのため、この機能は撤去した。
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     NSDictionary *containers = ((NSDictionary * (*)(id, SEL))objc_msgSend)(self, @selector(visibleItemContainers));

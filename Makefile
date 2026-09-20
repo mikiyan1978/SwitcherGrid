@@ -14,7 +14,7 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 
 BUNDLE_NAME = SwitcherGridPrefs
 
-SwitcherGridPrefs_FILES = Prefs/SGRootListController.m Prefs/SGAnimationCell.m
+SwitcherGridPrefs_FILES = Prefs/SGRootListController.m
 SwitcherGridPrefs_FRAMEWORKS = UIKit
 SwitcherGridPrefs_PRIVATE_FRAMEWORKS = Preferences
 SwitcherGridPrefs_INSTALL_PATH = /Library/PreferenceBundles
