@@ -32,6 +32,7 @@
 // probe run against this exact SpringBoard build).
 
 #import <UIKit/UIKit.h>
+#import <CoreFoundation/CoreFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <string.h>
@@ -128,13 +129,23 @@ static void KGRefreshConfigIfChanged(void) {
     }
 }
 
+// Long-press writes must go through CFPreferences (the same mechanism
+// AltList's picker uses via NSUserDefaults), not a raw writeToFile: -- a
+// direct file write bypasses cfprefsd entirely, so cfprefsd's in-memory
+// cache for this suite stays stale in Preferences.app and the AltList
+// picker's checkmarks don't reflect a long-press toggle until something
+// else happens to invalidate that cache (confirmed as the cause of a
+// real on-device desync report, 2026-09-22). Writing via
+// CFPreferencesSetAppValue + CFPreferencesAppSynchronize makes cfprefsd
+// itself perform the write, so every reader (this process's own stat()-based
+// polling, and any other process reading via NSUserDefaults/CFPreferences)
+// sees the same fresh value.
 static void KGWriteConfigToDisk(void) {
-    NSDictionary *existingRoot = [NSDictionary dictionaryWithContentsOfFile:KG_CONFIG_PATH];
-    NSMutableDictionary *root = existingRoot ? [existingRoot mutableCopy] : [NSMutableDictionary dictionary];
-    root[@"ProtectedBundleIDs"] = gKGWatchedApps;
-    BOOL ok = [root writeToFile:KG_CONFIG_PATH atomically:YES];
+    CFStringRef appID = CFSTR("com.mikiyan1978.appguardian");
+    CFPreferencesSetAppValue(CFSTR("ProtectedBundleIDs"), (__bridge CFArrayRef)gKGWatchedApps, appID);
+    Boolean ok = CFPreferencesAppSynchronize(appID);
     gKGConfigMtime = KGConfigFileMtime();
-    KGWriteLog(@"WriteConfigToDisk: wrote %lu bundle ID(s), ok=%d", (unsigned long)gKGWatchedApps.count, ok);
+    KGWriteLog(@"WriteConfigToDisk: wrote %lu bundle ID(s) via CFPreferences, ok=%d", (unsigned long)gKGWatchedApps.count, ok);
 }
 
 // Scans installed app bundles for one matching bundleID and reads its
@@ -149,8 +160,11 @@ static NSDictionary *KGDeriveAppMetadata(NSString *bundleID) {
     if (cached) return cached;
 
     NSString *processName = nil, *urlScheme = nil;
-    NSString *appsDir = @"/var/containers/Bundle/Application";
     NSFileManager *fm = [NSFileManager defaultManager];
+
+    // App Store-style sandboxed apps (Spotify, Drive, YouTube, ...) live
+    // under one UUID-named container each here.
+    NSString *appsDir = @"/var/containers/Bundle/Application";
     for (NSString *containerName in [fm contentsOfDirectoryAtPath:appsDir error:nil]) {
         NSString *containerPath = [appsDir stringByAppendingPathComponent:containerName];
         for (NSString *item in [fm contentsOfDirectoryAtPath:containerPath error:nil]) {
@@ -173,6 +187,32 @@ static NSDictionary *KGDeriveAppMetadata(NSString *bundleID) {
         if (processName) break;
     }
 
+    // Rootful jailbreak-style system apps (our own BGBeacon test app, and
+    // any similar tweak-installed .app) live directly under /Applications
+    // instead -- confirmed on-device (2026-09-22) that BGBeacon's jetsam
+    // boost silently never applied because this second location wasn't
+    // checked, not because memorystatus_control itself failed.
+    if (!processName) {
+        NSString *systemAppsDir = @"/Applications";
+        for (NSString *item in [fm contentsOfDirectoryAtPath:systemAppsDir error:nil]) {
+            if (![item hasSuffix:@".app"]) continue;
+            NSString *infoPlistPath = [[systemAppsDir stringByAppendingPathComponent:item]
+                                        stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+            if (!info || ![info[@"CFBundleIdentifier"] isEqualToString:bundleID]) continue;
+
+            processName = info[@"CFBundleExecutable"];
+            for (NSDictionary *type in info[@"CFBundleURLTypes"]) {
+                NSArray *schemes = type[@"CFBundleURLSchemes"];
+                if ([schemes.firstObject isKindOfClass:[NSString class]]) {
+                    urlScheme = [NSString stringWithFormat:@"%@://", schemes.firstObject];
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     if (processName) result[@"ProcessName"] = processName;
     if (urlScheme) result[@"URLScheme"] = urlScheme;
@@ -193,6 +233,22 @@ static NSNumber *KGToggleEnabledForBundleID(NSString *bundleID) {
         gKGWatchedApps = [gKGWatchedApps arrayByAddingObject:bundleID];
     }
     KGWriteConfigToDisk();
+
+    // Root.plist's picker row has PostNotification =
+    // com.mikiyan1978.appguardian/reload for exactly this: PSListController
+    // rows configured with PostNotification react to it by refreshing their
+    // own displayed state, which is how Settings toggles usually stay live
+    // when something changes their value from outside the Settings UI. A
+    // long-press only writes the file via CFPreferences (see
+    // KGWriteConfigToDisk) -- it never fires that notification on its own,
+    // so if the picker screen is already open when a long-press happens,
+    // its checkmarks stayed stale until the screen was closed and reopened.
+    // Posting it here makes a long-press behave the same as toggling it
+    // from within the picker itself.
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                          CFSTR("com.mikiyan1978.appguardian/reload"),
+                                          NULL, NULL, true);
+
     KGWriteLog(@"ToggleEnabledForBundleID: %@ -> %d", bundleID, !currentlyProtected);
     return @(!currentlyProtected);
 }
@@ -251,12 +307,25 @@ static void KGPauseImmediatelyOnKill(void) {
 // picks off every other background app before even considering these.
 extern "C" int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
                                      void *buffer, size_t buffersize);
-#define KG_MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES 6
+// Bug found 2026-09-22: this was previously commanded as 6, and the boost
+// silently failed with EPERM for every app it was ever tried against
+// (including real App Store apps like Spotify, not just our own test app
+// -- confirmed via newly-added error logging). XNU's real
+// kern_memorystatus.h defines MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES as
+// 2, not 6 -- command 6 apparently maps to something permission-gated on
+// this build. The struct layout was also wrong (user_data was int32_t;
+// XNU declares it uint64_t), which would have corrupted the call's second
+// field regardless of the command number bug.
+#define KG_MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES 2
+// 16 (JETSAM_PRIORITY_FOREGROUND on this XNU version, empirically -- 17/18/19
+// all returned EPERM when tried) is the ceiling SpringBoard's own process
+// appears able to grant. Return code is logged below so any future rejection
+// is visible instead of assumed.
 #define KG_JETSAM_PRIORITY_FOREGROUND 16
 
 struct kg_memorystatus_priority_properties {
     int32_t priority;
-    int32_t user_data;
+    uint64_t user_data;
 };
 
 static pid_t KGFindPIDByName(const char *name) {
@@ -280,11 +349,19 @@ static void KGBoostJetsamPriorityForWatchedApps(void) {
     KGRefreshConfigIfChanged();
     for (NSString *bundleID in gKGWatchedApps) {
         NSString *processName = KGDeriveAppMetadata(bundleID)[@"ProcessName"];
-        if (![processName isKindOfClass:[NSString class]] || processName.length == 0) continue;
+        if (![processName isKindOfClass:[NSString class]] || processName.length == 0) {
+            KGWriteLog(@"jetsam boost: no ProcessName derived for %@", bundleID);
+            continue;
+        }
         pid_t pid = KGFindPIDByName([processName UTF8String]);
-        if (pid <= 0) continue;
+        if (pid <= 0) {
+            KGWriteLog(@"jetsam boost: could not find running PID for %@ (process name %@)", bundleID, processName);
+            continue;
+        }
         struct kg_memorystatus_priority_properties props = { KG_JETSAM_PRIORITY_FOREGROUND, 0 };
-        memorystatus_control(KG_MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES, pid, 0, &props, sizeof(props));
+        int rc = memorystatus_control(KG_MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES, pid, 0, &props, sizeof(props));
+        KGWriteLog(@"jetsam boost applied to %@ (pid %d), priority=%d, rc=%d (errno %d)",
+                   bundleID, pid, KG_JETSAM_PRIORITY_FOREGROUND, rc, errno);
     }
 }
 
