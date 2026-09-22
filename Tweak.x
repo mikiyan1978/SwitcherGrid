@@ -33,6 +33,17 @@ static const NSInteger kGridStyleValue = 2; // Apple純正の「グリッドス�
 static BOOL gGridEnabled = YES;
 static BOOL gKillAllSwipeEnabled = YES;
 
+// Shared with KillGuard.xm (same dylib): -[SBFluidSwitcherViewController
+// killContainer:forReason:] is the SAME real Apple method a genuine
+// single-app swipe-kill calls (confirmed on-device 2026-09-21 -- a plain
+// swipe logged as "BLOCKED killContainer:forReason:" even after KillGuard
+// was scoped to "kill-all only", because from that hook's point of view
+// the two calls are indistinguishable). This flag is this file's own
+// signal for "the call about to happen is specifically part of a kill-all
+// sweep", set just before each staggered call and cleared right after, so
+// KillGuard can tell them apart and leave a real single swipe alone.
+BOOL gSGKillAllInProgress = NO;
+
 static void SGReloadPrefs(void) {
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:kPrefsPath];
     gGridEnabled = prefs[@"GridEnabled"] ? [prefs[@"GridEnabled"] boolValue] : YES;
@@ -110,25 +121,56 @@ static void SGReloadPrefs(void) {
 // カード自体のframe/transformはswitcher内部の連続再レイアウトが常時上書きするため、
 // 独自のUIViewアニメーションは効かない(実機で確認済み)。代わりに各killのタイミングに
 // 合わせてハプティックを刻み、体感的な波を作る。
+//
+// バグ修正の経緯(2026-09-22, 実機報告): アプリ数が多いと全部killされず、しかも
+// 「見えている分→少し遅れて残り」の2段階になるのが気になる、との指摘。
+// 原因はどちらも同じ: -visibleItemContainersは名前通り「現在画面内に
+// レイアウトされているカードのみ」を返す(スクロールでスイッチャー外に出ている
+// カードにはそもそもコンテナが実体として存在しない -- 通常のセル再利用型UIと
+// 同じ)。そのためコンテナ経由でしか全部を見つけられなかった。
+//
+// 修正: SBFluidSwitcherViewControllerには-appLayoutsという「画面外も含めた
+// 全アプリのモデル(SBAppLayout配列)」を返すgetterが別に存在する(実機の
+// メソッド一覧+型情報 @16@0:8 で確認済み)。これを使えば画面上のスクロール
+// 状態に関係なく全件を1回で取得できる。コンテナが無いものは
+// -_addVisibleItemContainerForAppLayout:reusingItemContainerIfExists:
+// (型 v32@0:8@16@24、実機で確認済み)で強制的に生成してからkillする。
+// これで発見に複数ラウンドかける必要がなくなり、全カードへ単一パスで
+// 同時にkillContainer:forReason:を呼べる(=見た目も本当に一括になる)。
 %new
 - (void)sg_killAllContainers {
-    NSDictionary *containers = ((NSDictionary * (*)(id, SEL))objc_msgSend)(self, @selector(visibleItemContainers));
-    NSArray *snapshot = [containers.allValues copy];
-    if (snapshot.count == 0) return;
+    id (*getAppLayoutsFn)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+    NSArray *appLayouts = getAppLayoutsFn(self, @selector(appLayouts));
+    if (appLayouts.count == 0) return;
+
+    id (*getContainerFn)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+    void (*addContainerFn)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
+    SEL getContainerSel = @selector(_itemContainerForAppLayoutIfExists:);
+    SEL addContainerSel = @selector(_addVisibleItemContainerForAppLayout:reusingItemContainerIfExists:);
+
+    NSMutableArray *containersToKill = [NSMutableArray arrayWithCapacity:appLayouts.count];
+    for (id appLayout in appLayouts) {
+        id container = getContainerFn(self, getContainerSel, appLayout);
+        if (!container) {
+            addContainerFn(self, addContainerSel, appLayout, nil);
+            container = getContainerFn(self, getContainerSel, appLayout);
+        }
+        if (container) {
+            [containersToKill addObject:container];
+        }
+    }
 
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
     [haptic prepare];
     [haptic impactOccurred];
 
-    NSTimeInterval stagger = 0.15;
     void (*killIMP)(id, SEL, id, NSInteger) = (void (*)(id, SEL, id, NSInteger))objc_msgSend;
     SEL killSel = @selector(killContainer:forReason:);
-    [snapshot enumerateObjectsUsingBlock:^(id container, NSUInteger idx, BOOL *stop) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((double)idx * stagger * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            killIMP(self, killSel, container, 1);
-            if (idx > 0) [haptic impactOccurred];
-        });
-    }];
+    gSGKillAllInProgress = YES;
+    for (id container in containersToKill) {
+        killIMP(self, killSel, container, 1);
+    }
+    gSGKillAllInProgress = NO;
 }
 
 %new

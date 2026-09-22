@@ -4,5 +4,11 @@
 "KillAllFooter" = "アプリスイッチャーでカードを下にスワイプするか、右上の「すべて閉じる」ボタンをタップすると、表示中の全アプリを波状のアニメーションでkillします。何もない状態でアプリスイッチャーを開くと、自動でホーム画面に戻ります。";
 "KillAllEnabledLabel" = "全killを有効化";
 
+"KillGuardFooter" = "選択したアプリはアプリスイッチャーでのスワイプkill・全killから保護されます。アプリスイッチャー内のカードを長押ししても同じON/OFFを切り替えられます。";
+"KillGuardAppsLabel" = "保護対象アプリを選択";
+
+"StayForegroundFooter" = "上の「保護対象アプリを選択」でチェックしたアプリは、バックグラウンドに回る(非アクティブ化される)ことも防ぎます(実験的機能)。Kill Guardと同じ保護対象アプリ一覧を共有します。";
+"StayForegroundEnabledLabel" = "バックグラウンド回避を有効化";
+
 "RespringFooter" = "SwitcherGridの設定変更を確実に反映するには、リスプリングしてください。";
 "RespringLabel" = "Respring";

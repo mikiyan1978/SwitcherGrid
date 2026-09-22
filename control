@@ -6,5 +6,5 @@ Description: Displays the App Switcher (multitasking) screen as Apple's built-in
 Maintainer: mikiyan1978
 Author: mikiyan1978
 Section: Tweaks
-Depends: mobilesubstrate (>= 0.9.5000), preferenceloader
+Depends: mobilesubstrate (>= 0.9.5000), preferenceloader, com.opa334.altlist
 Icon: /Library/PreferenceBundles/SwitcherGridPrefs.bundle/icon@3x.png

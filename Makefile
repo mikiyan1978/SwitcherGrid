@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = SwitcherGrid
 
-SwitcherGrid_FILES = Tweak.x
+SwitcherGrid_FILES = Tweak.x KillGuard.xm StayForeground.xm
 SwitcherGrid_CFLAGS = -fobjc-arc
 SwitcherGrid_FRAMEWORKS = UIKit Foundation
 

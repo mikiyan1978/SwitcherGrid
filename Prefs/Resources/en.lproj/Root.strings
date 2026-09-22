@@ -4,5 +4,11 @@
 "KillAllFooter" = "Swipe down on any card in the App Switcher, or tap the \"Close All\" button in the top right, to kill every open app with a cascading animation. Opening the App Switcher with nothing running returns to the Home Screen automatically.";
 "KillAllEnabledLabel" = "Enable Kill All";
 
+"KillGuardFooter" = "Apps checked here are protected from being killed in the App Switcher (single-app swipe and kill all). Long-pressing a card in the switcher toggles the same setting.";
+"KillGuardAppsLabel" = "Choose Protected Apps";
+
+"StayForegroundFooter" = "Apps checked in \"Choose Protected Apps\" above are also prevented from being backgrounded/deactivated (experimental). Uses the same protected-apps list as Kill Guard.";
+"StayForegroundEnabledLabel" = "Enable Stay Foreground";
+
 "RespringFooter" = "Respring to make sure SwitcherGrid's settings changes take effect.";
 "RespringLabel" = "Respring";
