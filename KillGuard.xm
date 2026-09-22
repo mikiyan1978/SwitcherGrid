@@ -37,7 +37,6 @@
 #import <objc/message.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/sysctl.h>
 #include <errno.h>
 #include <signal.h>
 #include <dlfcn.h>
@@ -87,14 +86,8 @@ static void KGWriteLog(NSString *format, ...) {
 // AltList's own picker is a real, tested, widely-used component instead
 // of guessing at PSListController internals a second time.
 //
-// No richer per-app metadata (ProcessName/URLScheme) is persisted anymore
-// -- AltList's picker only knows about bundle IDs. Anything needing that
-// metadata (jetsam boost, relaunch fallback) derives it on demand from
-// each app's own Info.plist via KGDeriveAppMetadata, with a small cache
-// since it's now looked up more often than just on long-press.
 static NSArray<NSString *> *gKGWatchedApps = nil; // bundle IDs
 static time_t gKGConfigMtime = 0;
-static NSMutableDictionary<NSString *, NSDictionary *> *gKGMetadataCache = nil;
 
 static time_t KGConfigFileMtime(void) {
     struct stat st;
@@ -115,7 +108,6 @@ static void KGLoadConfig(void) {
     }
     gKGWatchedApps = [valid copy];
     gKGConfigMtime = KGConfigFileMtime();
-    gKGMetadataCache = [NSMutableDictionary dictionary]; // config changed -- don't trust stale metadata
     KGWriteLog(@"LoadConfig: %lu app(s) in ProtectedBundleIDs", (unsigned long)gKGWatchedApps.count);
 }
 
@@ -146,78 +138,6 @@ static void KGWriteConfigToDisk(void) {
     Boolean ok = CFPreferencesAppSynchronize(appID);
     gKGConfigMtime = KGConfigFileMtime();
     KGWriteLog(@"WriteConfigToDisk: wrote %lu bundle ID(s) via CFPreferences, ok=%d", (unsigned long)gKGWatchedApps.count, ok);
-}
-
-// Scans installed app bundles for one matching bundleID and reads its
-// CFBundleExecutable (the actual process name shown in the process table,
-// which is not reliably the same string as the bundle ID) and, if
-// present, a URL scheme to use as the relaunch fallback elsewhere in this
-// project. Cached per bundle ID (invalidated on config reload) since this
-// can now be called from the jetsam-boost timer, not just a rare
-// long-press.
-static NSDictionary *KGDeriveAppMetadata(NSString *bundleID) {
-    NSDictionary *cached = gKGMetadataCache[bundleID];
-    if (cached) return cached;
-
-    NSString *processName = nil, *urlScheme = nil;
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    // App Store-style sandboxed apps (Spotify, Drive, YouTube, ...) live
-    // under one UUID-named container each here.
-    NSString *appsDir = @"/var/containers/Bundle/Application";
-    for (NSString *containerName in [fm contentsOfDirectoryAtPath:appsDir error:nil]) {
-        NSString *containerPath = [appsDir stringByAppendingPathComponent:containerName];
-        for (NSString *item in [fm contentsOfDirectoryAtPath:containerPath error:nil]) {
-            if (![item hasSuffix:@".app"]) continue;
-            NSString *infoPlistPath = [[containerPath stringByAppendingPathComponent:item]
-                                        stringByAppendingPathComponent:@"Info.plist"];
-            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
-            if (!info || ![info[@"CFBundleIdentifier"] isEqualToString:bundleID]) continue;
-
-            processName = info[@"CFBundleExecutable"];
-            for (NSDictionary *type in info[@"CFBundleURLTypes"]) {
-                NSArray *schemes = type[@"CFBundleURLSchemes"];
-                if ([schemes.firstObject isKindOfClass:[NSString class]]) {
-                    urlScheme = [NSString stringWithFormat:@"%@://", schemes.firstObject];
-                    break;
-                }
-            }
-            break;
-        }
-        if (processName) break;
-    }
-
-    // Rootful jailbreak-style system apps (our own BGBeacon test app, and
-    // any similar tweak-installed .app) live directly under /Applications
-    // instead -- confirmed on-device (2026-09-22) that BGBeacon's jetsam
-    // boost silently never applied because this second location wasn't
-    // checked, not because memorystatus_control itself failed.
-    if (!processName) {
-        NSString *systemAppsDir = @"/Applications";
-        for (NSString *item in [fm contentsOfDirectoryAtPath:systemAppsDir error:nil]) {
-            if (![item hasSuffix:@".app"]) continue;
-            NSString *infoPlistPath = [[systemAppsDir stringByAppendingPathComponent:item]
-                                        stringByAppendingPathComponent:@"Info.plist"];
-            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
-            if (!info || ![info[@"CFBundleIdentifier"] isEqualToString:bundleID]) continue;
-
-            processName = info[@"CFBundleExecutable"];
-            for (NSDictionary *type in info[@"CFBundleURLTypes"]) {
-                NSArray *schemes = type[@"CFBundleURLSchemes"];
-                if ([schemes.firstObject isKindOfClass:[NSString class]]) {
-                    urlScheme = [NSString stringWithFormat:@"%@://", schemes.firstObject];
-                    break;
-                }
-            }
-            break;
-        }
-    }
-
-    NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    if (processName) result[@"ProcessName"] = processName;
-    if (urlScheme) result[@"URLScheme"] = urlScheme;
-    gKGMetadataCache[bundleID] = result;
-    return result;
 }
 
 // Toggles protection for bundleID (add if absent, remove if present).
@@ -295,74 +215,6 @@ static void KGPauseImmediatelyOnKill(void) {
     if (!gKGMRSendCommand) return;
     Boolean sendResult = gKGMRSendCommand(kKGMRCommandPause, nil);
     KGWriteLog(@"kill requested -- sent immediate Pause, MRMediaRemoteSendCommand returned %d", sendResult);
-}
-
-#pragma mark - Jetsam priority boost
-//
-// No separate daemon needed for this -- memorystatus_control is a plain
-// libsystem_kernel.dylib syscall wrapper (real export, just undeclared in
-// the public SDK headers), callable directly from SpringBoard's own
-// process on a timer. Boosts each currently-running protected app to the
-// same jetsam priority band the actual foreground app runs at, so jetsam
-// picks off every other background app before even considering these.
-extern "C" int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
-                                     void *buffer, size_t buffersize);
-// Bug found 2026-09-22: this was previously commanded as 6, and the boost
-// silently failed with EPERM for every app it was ever tried against
-// (including real App Store apps like Spotify, not just our own test app
-// -- confirmed via newly-added error logging). XNU's real
-// kern_memorystatus.h defines MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES as
-// 2, not 6 -- command 6 apparently maps to something permission-gated on
-// this build. The struct layout was also wrong (user_data was int32_t;
-// XNU declares it uint64_t), which would have corrupted the call's second
-// field regardless of the command number bug.
-#define KG_MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES 2
-// 16 (JETSAM_PRIORITY_FOREGROUND on this XNU version, empirically -- 17/18/19
-// all returned EPERM when tried) is the ceiling SpringBoard's own process
-// appears able to grant. Return code is logged below so any future rejection
-// is visible instead of assumed.
-#define KG_JETSAM_PRIORITY_FOREGROUND 16
-
-struct kg_memorystatus_priority_properties {
-    int32_t priority;
-    uint64_t user_data;
-};
-
-static pid_t KGFindPIDByName(const char *name) {
-    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
-    size_t size = 0;
-    if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0) return 0;
-    size += size / 4;
-    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(size);
-    if (!procs) return 0;
-    if (sysctl(mib, 4, procs, &size, NULL, 0) != 0) { free(procs); return 0; }
-    pid_t found = 0;
-    int count = (int)(size / sizeof(struct kinfo_proc));
-    for (int i = 0; i < count; i++) {
-        if (strcmp(procs[i].kp_proc.p_comm, name) == 0) { found = procs[i].kp_proc.p_pid; break; }
-    }
-    free(procs);
-    return found;
-}
-
-static void KGBoostJetsamPriorityForWatchedApps(void) {
-    KGRefreshConfigIfChanged();
-    for (NSString *bundleID in gKGWatchedApps) {
-        NSString *processName = KGDeriveAppMetadata(bundleID)[@"ProcessName"];
-        if (![processName isKindOfClass:[NSString class]] || processName.length == 0) {
-            KGWriteLog(@"jetsam boost: no ProcessName derived for %@", bundleID);
-            continue;
-        }
-        pid_t pid = KGFindPIDByName([processName UTF8String]);
-        if (pid <= 0) {
-            KGWriteLog(@"jetsam boost: could not find running PID for %@ (process name %@)", bundleID, processName);
-            continue;
-        }
-        struct kg_memorystatus_priority_properties props = { KG_JETSAM_PRIORITY_FOREGROUND, 0 };
-        int rc = memorystatus_control(KG_MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES, pid, 0, &props, sizeof(props));
-        KGWriteLog(@"jetsam boost applied to %@ (pid %d), priority=%d, rc=%d (errno %d)",
-                   bundleID, pid, KG_JETSAM_PRIORITY_FOREGROUND, rc, errno);
-    }
 }
 
 #pragma mark - Bundle ID lookup helpers
@@ -582,19 +434,13 @@ static const void *kKGLongPressKey = &kKGLongPressKey;
     KGResolveMediaRemoteSymbols();
     %init(KillGuardHooks);
 
-    // Jetsam priority boost runs on a simple repeating timer rather than a
-    // separate daemon -- one fewer moving part, and memorystatus_control
-    // works fine called directly from SpringBoard's own process. Held in
-    // a static so it isn't deallocated (a source with no strong owner is
-    // invalidated under ARC) -- SpringBoard's process lifetime is this
-    // timer's whole intended lifetime anyway, so it's never torn down.
-    static dispatch_source_t sKGJetsamTimer;
-    sKGJetsamTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    dispatch_source_set_timer(sKGJetsamTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 5 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
-    dispatch_source_set_event_handler(sKGJetsamTimer, ^{
-        KGBoostJetsamPriorityForWatchedApps();
-    });
-    dispatch_resume(sKGJetsamTimer);
+    // Jetsam priority boost moved out to jetsamboostd (a separate root
+    // LaunchDaemon, see ~/iOSTweaks/JetsamBoostDaemon) -- confirmed
+    // on-device 2026-09-22 that memorystatus_control's priority-set command
+    // requires root UID; SpringBoard runs as mobile and always got EPERM
+    // here, silently, for every app ever tried (this file's old
+    // KGBoostJetsamPriorityForWatchedApps/KGFindPIDByName never actually
+    // worked despite years of no error logging to reveal that).
 
     KGWriteLog(@"KillGuard ctor loaded, protecting %lu app(s)", (unsigned long)gKGWatchedApps.count);
 }
