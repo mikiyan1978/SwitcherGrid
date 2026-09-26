@@ -76,13 +76,21 @@ static void SFWriteLog(NSString *format, ...) {
 
 static NSArray<NSString *> *gSFWatchedApps = nil; // bundle IDs, shared catalog
 static BOOL gSFFeatureEnabled = YES;
-static time_t gSFConfigMtime = 0;
-static time_t gSFPrefsMtime = 0;
+// int64 nanoseconds, not time_t (1-second resolution) -- confirmed on-device
+// 2026-09-23 that a long-press toggle followed within the same wall-clock
+// second by a background attempt could miss the config change entirely:
+// st_mtime rounds to the second, so two file writes/reads landing in the
+// same second compare equal even though the file genuinely changed,
+// leaving the stale in-memory catalog cached until something touched the
+// file in a LATER second (e.g. opening the Settings picker, which just
+// happened to re-save and bump the mtime again).
+static int64_t gSFConfigMtimeNS = 0;
+static int64_t gSFPrefsMtimeNS = 0;
 
-static time_t SFFileMtime(NSString *path) {
+static int64_t SFFileMtime(NSString *path) {
     struct stat st;
     if (stat([path fileSystemRepresentation], &st) != 0) return 0;
-    return st.st_mtime;
+    return (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
 }
 
 static void SFLoadConfig(void) {
@@ -95,21 +103,21 @@ static void SFLoadConfig(void) {
         }
     }
     gSFWatchedApps = [valid copy];
-    gSFConfigMtime = SFFileMtime(SF_CONFIG_PATH);
+    gSFConfigMtimeNS = SFFileMtime(SF_CONFIG_PATH);
 
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:SF_SWITCHERGRID_PREFS_PATH];
     id enabledValue = prefs[@"StayForegroundEnabled"];
     gSFFeatureEnabled = enabledValue ? [enabledValue boolValue] : YES;
-    gSFPrefsMtime = SFFileMtime(SF_SWITCHERGRID_PREFS_PATH);
+    gSFPrefsMtimeNS = SFFileMtime(SF_SWITCHERGRID_PREFS_PATH);
 
     SFWriteLog(@"LoadConfig: enabled=%d, %lu app(s) in shared catalog", gSFFeatureEnabled, (unsigned long)gSFWatchedApps.count);
 }
 
 static void SFRefreshConfigIfChanged(void) {
-    time_t configMtime = SFFileMtime(SF_CONFIG_PATH);
-    time_t prefsMtime = SFFileMtime(SF_SWITCHERGRID_PREFS_PATH);
-    if ((configMtime != 0 && configMtime != gSFConfigMtime) ||
-        (prefsMtime != 0 && prefsMtime != gSFPrefsMtime)) {
+    int64_t configMtime = SFFileMtime(SF_CONFIG_PATH);
+    int64_t prefsMtime = SFFileMtime(SF_SWITCHERGRID_PREFS_PATH);
+    if ((configMtime != 0 && configMtime != gSFConfigMtimeNS) ||
+        (prefsMtime != 0 && prefsMtime != gSFPrefsMtimeNS)) {
         SFLoadConfig();
     }
 }
@@ -150,6 +158,24 @@ static NSString *SFSceneBundleIdentifier(id scene) {
     SFRefreshConfigIfChanged();
     NSString *bundleID = SFSceneBundleIdentifier(self);
     if (SFIsWatchedBundleID(bundleID) && context == nil) {
+        // A 2026-09-23 change here narrowed this skip to only fire when
+        // `[settings deactivationReasons]` was already non-zero at entry,
+        // suspecting THIS hook was why killing an unrelated app in the
+        // switcher also stopped Music's playback. That narrowing was
+        // wrong on two counts: (1) it broke StayForeground's actual job --
+        // confirmed on-device (BGBeacon test app) that a real backgrounding
+        // transition can reach this call with deactivationReasons == 0 at
+        // entry (the reasons value apparently gets set through a path this
+        // check couldn't see), so the narrowed condition let real
+        // backgrounding straight through; (2) the real cause of the
+        // unrelated-kill-stops-music bug was found separately and fixed at
+        // its actual source -- KillGuard.xm's KGPauseImmediatelyOnKill()
+        // was blindly sending a MediaRemote Pause on every kill regardless
+        // of which app was killed, now gated on the killed app's PID
+        // actually matching Now Playing's PID. So the narrowing here was
+        // solving a problem that had already moved elsewhere. Reverted to
+        // the original, verified-working behavior: skip %orig entirely for
+        // this app whenever context is nil.
         SFWriteLog(@"skipped updateSettings (nil context) for %@", bundleID);
         return;
     }

@@ -40,6 +40,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <dlfcn.h>
+#include <sys/sysctl.h>
 
 extern const char *getprogname(void);
 
@@ -87,17 +88,30 @@ static void KGWriteLog(NSString *format, ...) {
 // of guessing at PSListController internals a second time.
 //
 static NSArray<NSString *> *gKGWatchedApps = nil; // bundle IDs
-static time_t gKGConfigMtime = 0;
+// int64 nanoseconds, not time_t (1-second resolution) -- confirmed on-device
+// 2026-09-23 that a long-press toggle followed within the same wall-clock
+// second by something checking protection could miss the change: st_mtime
+// rounds to the second, so a write and a read landing in the same second
+// compare equal even though the file changed, leaving the stale catalog
+// cached until something touched the file again in a LATER second (in
+// practice, only noticed after opening the Settings picker, which
+// happened to re-save and bump the mtime a second time).
+static int64_t gKGConfigMtimeNS = 0;
 
-static time_t KGConfigFileMtime(void) {
+static int64_t KGConfigFileMtime(void) {
     struct stat st;
     if (stat([KG_CONFIG_PATH fileSystemRepresentation], &st) != 0) {
         return 0;
     }
-    return st.st_mtime;
+    return (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
 }
 
+// Forward declaration: real definition (with the sysctl-based PID lookup)
+// lives further down, but KGLoadConfig needs to call it on every reload.
+static void KGKillRunningAppByBundleID(NSString *bundleID);
+
 static void KGLoadConfig(void) {
+    NSArray<NSString *> *previousWatchedApps = gKGWatchedApps; // nil on the very first call
     NSDictionary *root = [NSDictionary dictionaryWithContentsOfFile:KG_CONFIG_PATH];
     NSArray *bundleIDs = root[@"ProtectedBundleIDs"];
     NSMutableArray *valid = [NSMutableArray array];
@@ -107,70 +121,36 @@ static void KGLoadConfig(void) {
         }
     }
     gKGWatchedApps = [valid copy];
-    gKGConfigMtime = KGConfigFileMtime();
+    gKGConfigMtimeNS = KGConfigFileMtime();
     KGWriteLog(@"LoadConfig: %lu app(s) in ProtectedBundleIDs", (unsigned long)gKGWatchedApps.count);
+
+    // Protection state for a running app doesn't retroactively apply to its
+    // already-connected scene -- kill it so its next launch picks up the
+    // new config immediately (see KGKillRunningAppByBundleID for the full
+    // reasoning). Skip this on the very first load (SpringBoard's own
+    // %ctor, or the first refresh after a respring): previousWatchedApps
+    // is nil then, and every app in an on-disk catalog would otherwise
+    // read as "just added," killing every already-running protected app
+    // for no reason right after every respring.
+    if (previousWatchedApps) {
+        NSMutableSet<NSString *> *changed = [NSMutableSet setWithArray:gKGWatchedApps];
+        [changed minusSet:[NSSet setWithArray:previousWatchedApps]]; // newly protected
+        NSMutableSet<NSString *> *noLongerWatched = [NSMutableSet setWithArray:previousWatchedApps];
+        [noLongerWatched minusSet:[NSSet setWithArray:gKGWatchedApps]]; // newly unprotected
+        [changed unionSet:noLongerWatched];
+        for (NSString *bundleID in changed) {
+            KGKillRunningAppByBundleID(bundleID);
+        }
+    }
 }
 
-// The long-press toggle (this file) and AltList's own Settings picker (a
-// separate process) both write straight to this file -- cheap to check
-// mtime on every %hook firing.
+// AltList's own Settings picker (a separate process) writes straight to
+// this file -- cheap to check mtime on every %hook firing.
 static void KGRefreshConfigIfChanged(void) {
-    time_t mtime = KGConfigFileMtime();
-    if (mtime != 0 && mtime != gKGConfigMtime) {
+    int64_t mtime = KGConfigFileMtime();
+    if (mtime != 0 && mtime != gKGConfigMtimeNS) {
         KGLoadConfig();
     }
-}
-
-// Long-press writes must go through CFPreferences (the same mechanism
-// AltList's picker uses via NSUserDefaults), not a raw writeToFile: -- a
-// direct file write bypasses cfprefsd entirely, so cfprefsd's in-memory
-// cache for this suite stays stale in Preferences.app and the AltList
-// picker's checkmarks don't reflect a long-press toggle until something
-// else happens to invalidate that cache (confirmed as the cause of a
-// real on-device desync report, 2026-09-22). Writing via
-// CFPreferencesSetAppValue + CFPreferencesAppSynchronize makes cfprefsd
-// itself perform the write, so every reader (this process's own stat()-based
-// polling, and any other process reading via NSUserDefaults/CFPreferences)
-// sees the same fresh value.
-static void KGWriteConfigToDisk(void) {
-    CFStringRef appID = CFSTR("com.mikiyan1978.appguardian");
-    CFPreferencesSetAppValue(CFSTR("ProtectedBundleIDs"), (__bridge CFArrayRef)gKGWatchedApps, appID);
-    Boolean ok = CFPreferencesAppSynchronize(appID);
-    gKGConfigMtime = KGConfigFileMtime();
-    KGWriteLog(@"WriteConfigToDisk: wrote %lu bundle ID(s) via CFPreferences, ok=%d", (unsigned long)gKGWatchedApps.count, ok);
-}
-
-// Toggles protection for bundleID (add if absent, remove if present).
-// Returns the new protected state.
-static NSNumber *KGToggleEnabledForBundleID(NSString *bundleID) {
-    KGRefreshConfigIfChanged();
-    BOOL currentlyProtected = [gKGWatchedApps containsObject:bundleID];
-    if (currentlyProtected) {
-        NSMutableArray *updated = [gKGWatchedApps mutableCopy];
-        [updated removeObject:bundleID];
-        gKGWatchedApps = [updated copy];
-    } else {
-        gKGWatchedApps = [gKGWatchedApps arrayByAddingObject:bundleID];
-    }
-    KGWriteConfigToDisk();
-
-    // Root.plist's picker row has PostNotification =
-    // com.mikiyan1978.appguardian/reload for exactly this: PSListController
-    // rows configured with PostNotification react to it by refreshing their
-    // own displayed state, which is how Settings toggles usually stay live
-    // when something changes their value from outside the Settings UI. A
-    // long-press only writes the file via CFPreferences (see
-    // KGWriteConfigToDisk) -- it never fires that notification on its own,
-    // so if the picker screen is already open when a long-press happens,
-    // its checkmarks stayed stale until the screen was closed and reopened.
-    // Posting it here makes a long-press behave the same as toggling it
-    // from within the picker itself.
-    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                          CFSTR("com.mikiyan1978.appguardian/reload"),
-                                          NULL, NULL, true);
-
-    KGWriteLog(@"ToggleEnabledForBundleID: %@ -> %d", bundleID, !currentlyProtected);
-    return @(!currentlyProtected);
 }
 
 #pragma mark - Stop lingering audio after a genuine kill
@@ -197,8 +177,10 @@ static NSNumber *KGToggleEnabledForBundleID(NSString *bundleID) {
 // unambiguous intent to stop it, so there's no need to wait for
 // confirmation.
 typedef Boolean (*KGMRSendCommand_t)(NSInteger command, id userInfo);
+typedef void (*KGMRGetNowPlayingPID_t)(dispatch_queue_t queue, void (^handler)(int pid));
 
 static KGMRSendCommand_t gKGMRSendCommand;
+static KGMRGetNowPlayingPID_t gKGMRGetNowPlayingPID;
 static const NSInteger kKGMRCommandPause = 1; // MRMediaRemoteCommandPause
 
 static void KGResolveMediaRemoteSymbols(void) {
@@ -208,13 +190,185 @@ static void KGResolveMediaRemoteSymbols(void) {
     // cheap insurance and matches what already worked before.
     void *handle = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW);
     gKGMRSendCommand = (KGMRSendCommand_t)dlsym(RTLD_DEFAULT, "MRMediaRemoteSendCommand");
-    KGWriteLog(@"MediaRemote symbols: dlopen handle=%p, sendCommand=%p", handle, gKGMRSendCommand);
+    gKGMRGetNowPlayingPID = (KGMRGetNowPlayingPID_t)dlsym(RTLD_DEFAULT, "MRMediaRemoteGetNowPlayingApplicationPID");
+    KGWriteLog(@"MediaRemote symbols: dlopen handle=%p, sendCommand=%p, getNowPlayingPID=%p", handle, gKGMRSendCommand, gKGMRGetNowPlayingPID);
+}
+
+static dispatch_queue_t KGMediaRemoteReplyQueue(void) {
+    // Deliberately NOT dispatch_get_main_queue(): KGGetNowPlayingPIDSync
+    // below blocks the calling thread (main, in practice -- killContainer:
+    // runs there) waiting on this handler, so the handler must run
+    // somewhere else or it deadlocks waiting for itself.
+    static dispatch_queue_t q;
+    static dispatch_once_t token;
+    dispatch_once(&token, ^{
+        q = dispatch_queue_create("com.mikiyan1978.killguard.mediaremote", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+// Blocking on purpose: killContainer: needs to know THIS SPECIFIC kill's
+// target vs. Now Playing before deciding whether to pause, and there's no
+// good way to defer that decision to later (the pause has to happen at
+// kill time or not at all, matching the existing "send Pause immediately,
+// optimistically" design elsewhere in this file). The underlying MediaRemote
+// round trip is normally a fast, locally-cached lookup (nowplayingd), so a
+// short cap here stays imperceptible; if it doesn't return in time, treat
+// that as "don't know" rather than block the kill gesture indefinitely.
+static pid_t KGGetNowPlayingPIDSync(void) {
+    if (!gKGMRGetNowPlayingPID) return -1;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block int resultPID = -1;
+    gKGMRGetNowPlayingPID(KGMediaRemoteReplyQueue(), ^(int pid) {
+        resultPID = pid;
+        dispatch_semaphore_signal(sem);
+    });
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)));
+    return (pid_t)resultPID;
+}
+
+// container -> appLayout -> preferred UIWindowScene -> its underlying
+// FBScene -> clientProcess -> pid looked correct (every hop responds to the
+// selector chased) but was confirmed on-device (2026-09-23, via Frida) to
+// always yield SpringBoard's OWN pid, for every container tried, regardless
+// of the actual app being killed. Root cause: the switcher card's container
+// class here is SBReusableSnapshotItemContainer -- a cached SNAPSHOT image
+// of the app, not a live scene connection -- so _preferredWindowScene has
+// no real per-app scene to hand back and appears to fall through to
+// SpringBoard's own. Abandoned this path entirely rather than keep
+// debugging an object graph that doesn't carry the information needed.
+//
+// Replacement: resolve bundle ID -> CFBundleExecutable (which
+// KGDeriveArbitraryBundleID already gets reliably for the killed
+// container) via a small on-disk scan, cached after first use since app
+// installs rarely change mid-session, then compare that executable name
+// against proc_name() of the Now Playing PID. Same "which real OS process
+// is this" question, asked from data that's actually available instead of
+// a scene-graph shortcut that silently wasn't wired the way it looked.
+typedef int (*KGProcNameFn)(int pid, void *buf, uint32_t buffersize);
+
+static KGProcNameFn KGProcNameSymbol(void) {
+    static KGProcNameFn fn;
+    static dispatch_once_t token;
+    dispatch_once(&token, ^{
+        fn = (KGProcNameFn)dlsym(RTLD_DEFAULT, "proc_name");
+    });
+    return fn;
+}
+
+static NSString *KGProcNameForPID(pid_t pid) {
+    KGProcNameFn fn = KGProcNameSymbol();
+    if (!fn || pid <= 0) return nil;
+    char name[64] = {0};
+    int len = fn(pid, name, sizeof(name));
+    if (len <= 0) return nil;
+    return [NSString stringWithUTF8String:name];
+}
+
+static NSMutableDictionary<NSString *, NSString *> *gKGBundleIDToExecutable = nil;
+
+static void KGWarmBundleExecutableCache(void) {
+    // Cheap enough to just scan everything once and cache the whole table,
+    // rather than re-scanning per lookup -- both search roots together
+    // (rootful device layout: user apps under Bundle/Application, a few
+    // system-style test apps like BGBeacon under /Applications) are a few
+    // hundred directories at most.
+    gKGBundleIDToExecutable = [NSMutableDictionary dictionary];
+    NSArray<NSString *> *searchDirs = @[@"/var/containers/Bundle/Application", @"/Applications"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *baseDir in searchDirs) {
+        for (NSString *entry in [fm contentsOfDirectoryAtPath:baseDir error:nil]) {
+            NSString *containerPath = [baseDir stringByAppendingPathComponent:entry];
+            for (NSString *sub in [fm contentsOfDirectoryAtPath:containerPath error:nil]) {
+                if (![sub hasSuffix:@".app"]) continue;
+                NSString *infoPlistPath = [[containerPath stringByAppendingPathComponent:sub] stringByAppendingPathComponent:@"Info.plist"];
+                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+                NSString *bid = info[@"CFBundleIdentifier"];
+                NSString *exe = info[@"CFBundleExecutable"];
+                if (bid && exe) gKGBundleIDToExecutable[bid] = exe;
+            }
+        }
+    }
+    KGWriteLog(@"WarmBundleExecutableCache: resolved %lu bundle(s)", (unsigned long)gKGBundleIDToExecutable.count);
+}
+
+static NSString *KGExecutableNameForBundleID(NSString *bundleID) {
+    if (!gKGBundleIDToExecutable) KGWarmBundleExecutableCache();
+    return gKGBundleIDToExecutable[bundleID];
+}
+
+// Same sysctl(KERN_PROC_ALL) scan JetsamBoostDaemon uses to resolve a bundle
+// ID to its live PID -- reimplemented here rather than shared, since this
+// file and that daemon don't share a build.
+static pid_t KGFindPIDByProcessName(const char *name) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t size = 0;
+    if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0) return 0;
+    size += size / 4;
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(size);
+    if (!procs) return 0;
+    if (sysctl(mib, 4, procs, &size, NULL, 0) != 0) { free(procs); return 0; }
+    pid_t found = 0;
+    int count = (int)(size / sizeof(struct kinfo_proc));
+    for (int i = 0; i < count; i++) {
+        if (strcmp(procs[i].kp_proc.p_comm, name) == 0) { found = procs[i].kp_proc.p_pid; break; }
+    }
+    free(procs);
+    return found;
+}
+
+// Protection only ever changes what happens on the NEXT backgrounding
+// decision or kill attempt -- an app already running keeps whatever scene
+// settings it already has until something re-triggers them. Killing it
+// outright is the direct way to make it pick up the new config
+// immediately.
+//
+// History (2026-09-23): tried detecting this automatically -- first via a
+// Darwin notification AltList is supposed to post on change (fired
+// unreliably), then a 2s poll timer with a per-app confirmation alert
+// (the poll itself worked once its dispatch_source_t was fixed to be a
+// static, not a local ARC-deallocated the moment the setup function
+// returned, but the end-to-end experience was still reported as
+// unstable/unpredictable). Replaced with an explicit "Apply" button in
+// the picker's own navigation bar (see the ATLApplicationListMulti
+// SelectionController hook below) -- the button press itself is the
+// user's confirmation, so no separate alert is needed here.
+static void KGKillRunningAppByBundleID(NSString *bundleID) {
+    NSString *executable = KGExecutableNameForBundleID(bundleID);
+    if (!executable) return;
+    pid_t pid = KGFindPIDByProcessName([executable UTF8String]);
+    if (pid <= 0) return;
+    int result = kill(pid, SIGKILL);
+    KGWriteLog(@"protection toggled for %@ (exe=%@) -- killed running pid=%d to apply immediately, result=%d",
+               bundleID, executable, pid, result);
 }
 
 static void KGPauseImmediatelyOnKill(void) {
     if (!gKGMRSendCommand) return;
     Boolean sendResult = gKGMRSendCommand(kKGMRCommandPause, nil);
     KGWriteLog(@"kill requested -- sent immediate Pause, MRMediaRemoteSendCommand returned %d", sendResult);
+}
+
+// Only pause if the app actually being killed is the one actually making
+// sound right now -- not just "some media-capable app," which was still
+// wrong whenever a DIFFERENT watched app (e.g. Spotify) got killed while a
+// different one (e.g. Music) was the one really playing (confirmed
+// on-device 2026-09-23). A membership check in the watched catalog is kept
+// as a cheap pre-filter so ordinary non-media apps skip the Now Playing
+// round trip entirely; only a watched app pays that ~150ms-capped cost,
+// and only ever to confirm -- never to expand -- whether it's the real
+// target.
+static void KGPauseIfKillingNowPlayingApp(NSString *killedBundleID, id container) {
+    if (!killedBundleID || ![gKGWatchedApps containsObject:killedBundleID]) return;
+    NSString *killedExecutable = KGExecutableNameForBundleID(killedBundleID);
+    pid_t nowPlayingPID = KGGetNowPlayingPIDSync();
+    NSString *nowPlayingExecutable = KGProcNameForPID(nowPlayingPID);
+    if (killedExecutable && nowPlayingExecutable && [killedExecutable isEqualToString:nowPlayingExecutable]) {
+        KGPauseImmediatelyOnKill();
+    } else {
+        KGWriteLog(@"kill requested for %@ (exe=%@) but Now Playing pid=%d (exe=%@) -- not the same app, skipping Pause",
+                   killedBundleID, killedExecutable, nowPlayingPID, nowPlayingExecutable);
+    }
 }
 
 #pragma mark - Bundle ID lookup helpers
@@ -309,64 +463,22 @@ static NSString *KGDeriveArbitraryBundleID(id container) {
     return nil;
 }
 
-#pragma mark - Long-press toggle (no visual switcher badge)
+#pragma mark - Protection toggling
 
-static const void *kKGLongPressKey = &kKGLongPressKey;
-
-// History (2026-09-21, three separate approaches, each confirmed broken
-// on-device via user screenshots): a badge as a direct subview of
-// SBFluidSwitcherItemContainer, a separate overlay UIWindow tracking card
-// positions, and badges added to the switcher's own top-level view --
-// all three leaked into live foreground app content at some point. This
-// iOS build's switcher view hierarchy behaves in a way not accounted for
-// by any of those approaches, and without a real on-device view debugger
-// (not available in this setup), further attempts would be more guessing.
-//
-// Decision: drop the visual indicator entirely. Protection state is still
-// fully visible in Settings -> SwitcherGrid -> "Choose Protected Apps"
-// (SGAppListController), and the long-press toggle keeps working with
-// haptic-only feedback -- just without an on-card visual.
+// A long-press-on-card toggle (with haptic-only feedback, no on-card
+// visual) lived here through 2026-09-23. Three separate visual-badge
+// approaches (a direct subview, an overlay window, a top-level switcher
+// view badge) were all tried and confirmed broken on-device back on
+// 2026-09-21, and shipping the toggle anyway with haptic-only feedback
+// turned out not to actually work in practice either: with no visible
+// confirmation of which apps are currently protected, the gesture was
+// unusable (users can't tell whether a long-press did anything, or
+// dependably tell current state, without opening Settings anyway) --
+// removed rather than kept as a confusing, effectively-dead interaction.
+// Protection is configured exclusively from Settings -> SwitcherGrid ->
+// "Choose Protected Apps" (SGAppListController) now.
 
 %group KillGuardHooks
-
-%hook SBFluidSwitcherItemContainer
-
-%new
-- (void)kg_handleLongPress:(UILongPressGestureRecognizer *)gr {
-    if (gr.state != UIGestureRecognizerStateBegan) return;
-    KGRefreshConfigIfChanged();
-    // Works on ANY app card, not just ones already in the catalog --
-    // KGToggleEnabledForBundleID adds a fresh entry (protection defaulting
-    // to on) the first time a not-yet-catalogued app is long-pressed.
-    NSString *bundleID = KGDeriveArbitraryBundleID(self);
-    if (!bundleID) {
-        KGWriteLog(@"long-press: could not identify app for this card, ignoring");
-        return;
-    }
-    NSNumber *newState = KGToggleEnabledForBundleID(bundleID);
-    if (!newState) return;
-    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-    [haptic prepare];
-    [haptic impactOccurred];
-    KGWriteLog(@"long-press toggled %@ -> %@", bundleID, newState.boolValue ? @"protected" : @"unprotected");
-}
-
-- (id)initWithFrame:(CGRect)frame appLayout:(id)appLayout delegate:(id)delegate
-             active:(BOOL)active windowScene:(id)windowScene {
-    self = %orig;
-    if (self && !objc_getAssociatedObject(self, kKGLongPressKey)) {
-        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
-            initWithTarget:self action:@selector(kg_handleLongPress:)];
-        // 0.5s (a typical default) fired by accident during ordinary
-        // switcher browsing on-device -- 1.2s plus the default 10pt
-        // movement-cancel (built into UILongPressGestureRecognizer, so a
-        // real swipe self-cancels this) is a much harder accidental hit.
-        lp.minimumPressDuration = 1.2;
-        [(UIView *)self addGestureRecognizer:lp];
-        objc_setAssociatedObject(self, kKGLongPressKey, lp, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    return self;
-}
 
 // Tried porting com.sergy.immortalizer's -setKillable: hook here (forcing
 // NO for protected apps, matching their open-source Tweak.xm) to back
@@ -382,8 +494,6 @@ static const void *kKGLongPressKey = &kKGLongPressKey;
 // that regression; StayForeground's scene-level hooks (FBScene /
 // UIMutableApplicationSceneSettings, in StayForeground.xm) still apply on
 // their own, just without this third piece.
-
-%end
 
 // Deliberate scope, per explicit request (2026-09-21): protection now
 // ONLY blocks SwitcherGrid's own "kill all" bulk action
@@ -408,7 +518,22 @@ static const void *kKGLongPressKey = &kKGLongPressKey;
     // swipe was logging as "BLOCKED" even after this hook was supposedly
     // scoped to kill-all only).
     if (!gSGKillAllInProgress) {
-        KGPauseImmediatelyOnKill();
+        // KGPauseImmediatelyOnKill() used to fire unconditionally here for
+        // ANY single-app swipe-kill, on the assumption that a swipe means
+        // "the user wants this app's audio stopped." Confirmed on-device
+        // (2026-09-23) that's wrong whenever the killed app has nothing to
+        // do with audio: swiping away Filza or Settings while Music plays
+        // paused Music too, since this call has no idea which app it's
+        // even for -- it just blindly told MediaRemote to pause whatever
+        // happens to be Now Playing. A first fix narrowed this to "only a
+        // watched/media-capable app," but that was still wrong whenever the
+        // watched app being killed wasn't the one actually playing (e.g.
+        // killing Spotify while Music plays) -- confirmed on-device
+        // 2026-09-23. KGPauseIfKillingNowPlayingApp additionally confirms
+        // the killed app's own PID matches Now Playing's PID before pausing.
+        KGRefreshConfigIfChanged();
+        NSString *killedBundleID = KGDeriveArbitraryBundleID(container);
+        KGPauseIfKillingNowPlayingApp(killedBundleID, container);
         %orig;
         return;
     }
@@ -418,7 +543,11 @@ static const void *kKGLongPressKey = &kKGLongPressKey;
         KGWriteLog(@"BLOCKED killContainer:forReason: for %@ (reason=%ld)", bundleID, (long)reason);
         return;
     }
-    KGPauseImmediatelyOnKill();
+    // Same bug as the single-swipe branch above, just reached via kill-all's
+    // per-container sweep instead: this container isn't a watched/media app
+    // (those already returned via BLOCKED above), so it has nothing to do
+    // with whatever's actually playing -- don't pause Now Playing just
+    // because kill-all is tearing down an unrelated container.
     %orig;
 }
 
@@ -426,12 +555,25 @@ static const void *kKGLongPressKey = &kKGLongPressKey;
 
 %end // KillGuardHooks
 
+// An "Apply" button on AltList's own picker screen would need to run
+// inside Preferences.app's process (that's where
+// ATLApplicationListMultiSelectionController actually loads), not here --
+// this file only ever runs inside SpringBoard. See
+// Prefs/SGRootListController.m, which already runs in Preferences.app and
+// already force-loads AltList.framework, for that half of this feature.
+
 %ctor {
     if (strcmp(getprogname(), "SpringBoard") != 0) {
         return;
     }
     KGLoadConfig();
     KGResolveMediaRemoteSymbols();
+    // Pre-warm off the main thread so the directory scan never adds latency
+    // to an actual kill gesture -- the first swipe after a respring would
+    // otherwise pay this cost synchronously inside killContainer:forReason:.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        KGWarmBundleExecutableCache();
+    });
     %init(KillGuardHooks);
 
     // Jetsam priority boost moved out to jetsamboostd (a separate root

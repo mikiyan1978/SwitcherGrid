@@ -29,6 +29,51 @@ static void SGClearCacheNoOp(id self, SEL _cmd) {
     if (gSGOrigClearCache) gSGOrigClearCache(self, _cmd);
 }
 
+// "Apply" button on AltList's own protected-apps picker (pushed from this
+// Prefs bundle's own screen, so this file -- which already runs inside
+// Preferences.app's process -- is the right place for it, not KillGuard.xm,
+// which only ever runs inside SpringBoard and never sees this view
+// controller class at all).
+//
+// History (2026-09-23): tried applying a protection change immediately
+// without a full respring -- first automatically (a Darwin notification
+// AltList is supposed to post on change fired unreliably; a poll-timer
+// variant, even once its own dispatch_source_t retention bug was fixed,
+// still felt unstable/unpredictable end to end), then via this same button
+// killing only the specific apps whose protection changed. Simplified to a
+// full respring instead: blunt, but completely unambiguous -- every app
+// picks up the current ProtectedBundleIDs catalog fresh, guaranteed, the
+// same way any other config change in this project already required a
+// manual respring to apply (see sg_respringTapped's own comment). Reuses
+// that exact mechanism (SCPowerKit's respring if installed, sbreload
+// fallback otherwise) rather than duplicating it.
+static void SGApplyProtectionChangesNow(id self, SEL _cmd) {
+    Class powerKitClass = NSClassFromString(@"SCPowerKit");
+    SEL respringSel = @selector(respring);
+    if (powerKitClass && [powerKitClass respondsToSelector:respringSel]) {
+        ((void (*)(id, SEL))objc_msgSend)(powerKitClass, respringSel);
+        return;
+    }
+    pid_t pid;
+    char *args[] = {"/usr/bin/sbreload", NULL};
+    posix_spawn(&pid, "/usr/bin/sbreload", NULL, NULL, args, NULL);
+}
+
+static void (*gSGOrigALMSCViewDidLoad)(id, SEL);
+static void SGALMSCViewDidLoad(id self, SEL _cmd) {
+    if (gSGOrigALMSCViewDidLoad) gSGOrigALMSCViewDidLoad(self, _cmd);
+    UIViewController *vc = self;
+    vc.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"Apply"
+                                          style:UIBarButtonItemStyleDone
+                                         target:vc
+                                         action:@selector(sg_applyProtectionChangesTapped)];
+}
+
+@interface NSObject (SGApplyProtectionChangesButton)
+- (void)sg_applyProtectionChangesTapped;
+@end
+
 __attribute__((constructor))
 static void SGLoadAltListFramework(void) {
     dlopen("/Library/Frameworks/AltList.framework/AltList", RTLD_NOW);
@@ -39,6 +84,19 @@ static void SGLoadAltListFramework(void) {
     if (m) {
         gSGOrigClearCache = (void (*)(id, SEL))method_getImplementation(m);
         method_setImplementation(m, (IMP)SGClearCacheNoOp);
+    }
+
+    Class multiSelectCls = NSClassFromString(@"ATLApplicationListMultiSelectionController");
+    SEL viewDidLoadSel = @selector(viewDidLoad);
+    Method vdlMethod = multiSelectCls ? class_getInstanceMethod(multiSelectCls, viewDidLoadSel) : NULL;
+    if (vdlMethod) {
+        gSGOrigALMSCViewDidLoad = (void (*)(id, SEL))method_getImplementation(vdlMethod);
+        method_setImplementation(vdlMethod, (IMP)SGALMSCViewDidLoad);
+        // sg_applyProtectionChangesTapped itself is added as a real method
+        // (not just referenced via performSelector) so the button's target/
+        // action wiring above works the normal Cocoa way.
+        class_addMethod(multiSelectCls, @selector(sg_applyProtectionChangesTapped),
+                         (IMP)SGApplyProtectionChangesNow, "v@:");
     }
 }
 
